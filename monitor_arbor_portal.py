@@ -52,6 +52,25 @@ from dotenv import load_dotenv
 if load_dotenv:
     load_dotenv()
 
+import os, re
+from urllib.parse import urlparse, urlunparse
+
+# read from env as you do now
+ARBOR_BASE_URL = os.getenv("ARBOR_BASE_URL", "https://login.arbor.sc").rstrip("/")
+
+def normalize_base_url(url: str) -> str:
+    """Prefer the .sc tenant host; fall back to given URL."""
+    u = url.rstrip("/")
+    # If a reset link or .education host was pasted, try to map to .sc
+    if ".education" in u and ".arbor.education" in u:
+        # e.g. https://the-castle-school.uk.arbor.education/...  -> https://the-castle-school.uk.arbor.sc
+        parts = urlparse(u)
+        host = parts.netloc.replace(".arbor.education", ".arbor.sc")
+        return f"https://{host}"
+    return u
+
+ARBOR_BASE_URL = normalize_base_url(ARBOR_BASE_URL)
+
 # ---------------------------------------------------------------------
 # Telegram test helper (only runs if you use --test)
 # ---------------------------------------------------------------------
@@ -79,6 +98,16 @@ def telegram_test():
         print("⚠️  Telegram test error:", e)
         return False
 # ---------------------------------------------------------------------
+
+class MaintenanceMode(Exception):
+    pass
+
+def is_maintenance(page) -> bool:
+    try:
+        txt = (page.text_content("body") or "").lower()
+        return ("maintenance mode is turned on" in txt) or ("undergoing maintenance" in txt)
+    except Exception:
+        return False
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -219,25 +248,94 @@ def post_telegram(text: str) -> None:
 
 
 # Login and navigation
+import re
+
 def login_guardian(page) -> None:
-    page.goto(ARBOR_BASE_URL, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_load_state("networkidle")
+    """
+    Navigate to the guardian login, fill email/pass (and optional DOB),
+    and land on the portal home. Handles .sc/.education and maintenance.
+    """
+    base = ARBOR_BASE_URL
+    candidates = [
+        base,
+        f"{base}/auth/login",
+        f"{base}/login",
+    ]
 
-    page.get_by_label(re.compile("Email", re.I)).fill(ARBOR_EMAIL)
-    page.get_by_label(re.compile("Password|Passcode", re.I)).fill(ARBOR_PASSWORD)
-    page.get_by_role("button", name=re.compile("Log ?in|Sign ?in|Continue", re.I)).click()
+    # 1) Reach a login page
+    landed = False
+    for url in candidates:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_load_state("networkidle")
+            if is_maintenance(page):
+                raise MaintenanceMode("Arbor shows maintenance page")
+            landed = True
+            break
+        except MaintenanceMode:
+            raise
+        except Exception:
+            continue
+    if not landed:
+        raise RuntimeError("Could not reach Arbor login page. Check ARBOR_BASE_URL.")
 
+    # 2) Fill email (try several selectors)
+    email_filled = False
+    for kind, sel in [
+        ("label", re.compile(r"email", re.I)),
+        ("css", "input[type='email']"),
+        ("css", "input[name='email']"),
+        ("css", "input[autocomplete='username']"),
+    ]:
+        try:
+            el = page.get_by_label(sel) if kind == "label" else page.locator(sel).first
+            if el and el.is_visible():
+                el.fill(os.getenv("ARBOR_EMAIL", ""))
+                email_filled = True
+                break
+        except Exception:
+            pass
+    if not email_filled:
+        raise RuntimeError("Could not find email field — confirm you’re on the correct login page.")
+
+    # 3) Fill password
+    for kind, sel in [
+        ("label", re.compile(r"(password|passcode)", re.I)),
+        ("css", "input[type='password']"),
+        ("css", "input[name='password']"),
+        ("css", "input[autocomplete='current-password']"),
+    ]:
+        try:
+            el = page.get_by_label(sel) if kind == "label" else page.locator(sel).first
+            if el and el.is_visible():
+                el.fill(os.getenv("ARBOR_PASSWORD", ""))
+                break
+        except Exception:
+            pass
+
+    # 4) Submit
     try:
-        page.wait_for_timeout(600)
-        if ARBOR_CHILD_DOB:
-            dob_input = page.get_by_label(re.compile("Date of birth|DOB", re.I))
-            if dob_input.is_visible():
-                dob_input.fill(ARBOR_CHILD_DOB)
-                page.get_by_role("button", name=re.compile("Verify|Continue|Confirm", re.I)).click()
-    except PWTimeout:
-        pass
+        page.get_by_role("button", name=re.compile(r"(log ?in|sign ?in|continue)", re.I)).click()
+    except Exception:
+        btn = page.locator("button[type='submit']").first
+        if btn and btn.is_visible():
+            btn.click()
+
+    # 5) Optional DOB verification
+    dob = os.getenv("ARBOR_CHILD_DOB", "")
+    if dob:
+        try:
+            page.wait_for_timeout(600)
+            dob_input = page.get_by_label(re.compile(r"(date of birth|dob)", re.I))
+            if dob_input and dob_input.is_visible():
+                dob_input.fill(dob)
+                page.get_by_role("button", name=re.compile(r"(verify|continue|confirm)", re.I)).click()
+        except Exception:
+            pass
 
     page.wait_for_load_state("networkidle")
+    if is_maintenance(page):
+        raise MaintenanceMode("Arbor shows maintenance page")
 
 
 @dataclass
@@ -456,9 +554,13 @@ def main() -> int:
         browser = pw.chromium.launch(headless=not HEADFUL)
         context = browser.new_context()
         page = context.new_page()
-
-        # Login
-        login_guardian(page)
+        try:
+            login_guardian(page)
+        except MaintenanceMode:
+            # Optional: notify once per day, then exit 0 to avoid spam
+            # (You can keep the daily-notice logic we discussed earlier)
+            print("⚠️ Arbor is in maintenance mode. Will try again later.")
+            return 0
 
         # Crawl sections
         for fn in SECTIONS:
