@@ -43,24 +43,27 @@ python -m playwright install
 python monitor_arbor_portal.py
 """
 
-import hashlib
-import json
 import os
-import re
 import sys
-
-# --- Telegram connection test helper -------------------------------------
 import requests
+from dotenv import load_dotenv
 
+# Load .env file
+if load_dotenv:
+    load_dotenv()
+
+# ---------------------------------------------------------------------
+# Telegram test helper (only runs if you use --test)
+# ---------------------------------------------------------------------
 def telegram_test():
-    """Send a simple test message to confirm Telegram config works."""
+    """Send a one-off test message to confirm Telegram config works."""
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("⚠️  Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in .env")
         return False
     try:
-        msg = "✅ Telegram test passed — Arbor watcher is configured correctly."
+        msg = "✅ Telegram test passed — watcher starting."
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": msg},
@@ -75,7 +78,7 @@ def telegram_test():
     except Exception as e:
         print("⚠️  Telegram test error:", e)
         return False
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -507,9 +510,13 @@ def main() -> int:
     return 0
 
 
+# ---------------------------------------------------------------------
+# Entry point — ensures Telegram test runs only when you use --test
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     if "--test" in sys.argv:
         telegram_test()
         sys.exit(0)
     else:
         sys.exit(main())
+# ---------------------------------------------------------------------
