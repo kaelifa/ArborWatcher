@@ -141,6 +141,74 @@ Add these under your repo’s **Settings → Secrets and variables → Actions �
 - Auto-detects `.education` or `.sc` domains after login  
 - Works on macOS, Linux, or Windows  
 
+# 🧩 Workflows Overview
+
+Your repository now includes **two automated GitHub Actions workflows**, both using the same set of secrets.  
+These allow Arbor data monitoring and Telegram alerts to run safely in the cloud.
+
+## 🔔 1. `run-watcher.yml` — Full Portal Watcher
+Monitors **all major Arbor sections** (messages, communications, trips, payments, etc.) and sends a summary notification when anything changes.
+
+**Schedule:**  
+- Runs once per night (or on manual trigger).  
+
+**Secrets used:**  
+| Secret | Purpose |
+|:--|:--|
+| `ARBOR_EMAIL` | Arbor login email |
+| `ARBOR_PASSWORD` | Arbor password |
+| `TELEGRAM_TOKEN` | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Telegram chat/channel ID |
+| `ARBOR_BASE_URL` | Optional override (e.g. `https://the-castle-school.uk.arbor.education`) |
+
+**State file:**  
+`.arbor_everything_state.json` — cached between runs to detect changes.
+
+---
+
+## 🧮 2. `assignments-watcher.yml` — Homework / Lesson Alerts
+Lightweight watcher that focuses on **homework, assignments, and timetable updates**.  
+Ideal for near-real-time Telegram notifications.
+
+**Schedule:**  
+- Runs every **30 minutes**  
+- Can also be triggered manually from the **Actions** tab
+
+**Secrets used (same as above):**  
+| Secret | Purpose |
+|:--|:--|
+| `ARBOR_EMAIL` | Arbor login email |
+| `ARBOR_PASSWORD` | Arbor password |
+| `TELEGRAM_TOKEN` | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Telegram chat/channel ID |
+| *(optional)* `ARBOR_BASE_URL` | Fixed base URL for your school portal |
+
+**State file:**  
+`.arbor_assignments_state.json` — cached between runs to avoid duplicate Telegram alerts.
+
+---
+
+## 🧠 How to Run Manually
+
+1. Go to your repository on GitHub → **Actions** tab.  
+2. Select **“Arbor Assignments Watcher”** or **“Arbor Full Watcher”**.  
+3. Click **“Run workflow”** → confirm → it runs instantly in the cloud.  
+4. Check Telegram for updates 📨  
+
+---
+
+## 🛠️ Local Testing
+
+```bash
+# Install dependencies (once)
+python3 -m pip install playwright python-dotenv requests
+python3 -m playwright install
+
+# Run locally to check Telegram alerts
+python3 monitor_arbor_portal.py --fast
+python3 assignments_watcher.py --fast
+```
+
 ---
 
 **© 2025 ArborWatcher** — created and maintained by Kristina 🌿

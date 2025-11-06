@@ -1,0 +1,61 @@
+name: Arbor Assignments Watcher
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes
+  workflow_dispatch: # manual run
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright python-dotenv requests
+
+      - name: Install Playwright browsers & OS deps
+        run: |
+          python -m playwright install --with-deps
+
+      # Restore last run's state so we only alert on changes
+      - name: Restore state cache
+        id: cache-restore
+        uses: actions/cache@v4
+        with:
+          path: .arbor_assignments_state.json
+          key: arbor-assignments-state-v1-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            arbor-assignments-state-v1-${{ runner.os }}-
+
+      - name: Run assignments watcher (headless)
+        env:
+          ARBOR_EMAIL: ${{ secrets.ARBOR_EMAIL }}
+          ARBOR_PASSWORD: ${{ secrets.ARBOR_PASSWORD }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ARBOR_BASE_URL: ${{ secrets.ARBOR_BASE_URL }}
+          # polite but quick on CI
+          ARBOR_MIN_DELAY: "0.2"
+          ARBOR_MAX_DELAY: "0.6"
+        run: |
+          python assignments_watcher.py --headless
+
+      # Save updated state so the next run can diff
+      - name: Save state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .arbor_assignments_state.json
+          key: arbor-assignments-state-v1-${{ runner.os }}-${{ github.run_id }}
