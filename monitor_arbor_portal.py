@@ -1,342 +1,128 @@
 #!/usr/bin/env python3
 """
-Arbor Parent Portal — everything watcher (Telegram-enabled)
+monitor_arbor_portal.py — Polite watcher for Arbor Parent Portal
 
-Monitors key areas of the Arbor Parent Portal for changes and posts a digest
-to Telegram (free push to iPhone/iPad). Email and Discord webhook are optional.
+What it does:
+- Logs in via login_helper.login_guardian
+- Enters Guardian/Parent shell (auto‑retry)
+- Crawls key sections (messages, comms, noticeboard, calendar, trips, payments, clubs, documents)
+- Compares a compact hash of recent items against a state file
+- Sends a Telegram digest ONLY when changes are detected
+- Uses polite crawling (throttled actions, exponential backoff with jitter, identifiable headers)
 
-Watched areas (best-effort; selectors are written to be resilient):
-- In-app messages
-- Communications
-- Noticeboard / Announcements
-- Calendar / Events
-- Trips / Activities
-- Payments
-- Clubs
-- Documents
+Environment (.env or GitHub Secrets):
+  ARBOR_BASE_URL=...
+  ARBOR_EMAIL=...
+  ARBOR_PASSWORD=...
+  ARBOR_CHILD_DOB=...         # optional
+  ARBOR_LOGIN_METHOD=email    # optional
 
-Env vars (set as GitHub Secrets in Actions)
--------------------------------------------
-ARBOR_BASE_URL=https://the-castle-school.uk.arbor.sc
-ARBOR_EMAIL=you@example.com
-ARBOR_PASSWORD=*********
-ARBOR_CHILD_DOB=01/02/2014      # optional
+  TELEGRAM_TOKEN=123:ABC
+  TELEGRAM_CHAT_ID=123456789
 
-TELEGRAM_TOKEN=123:ABC          # Telegram bot token
-TELEGRAM_CHAT_ID=123456789      # your chat id
+  # Optional
+  STATE_FILE=.arbor_everything_state.json
 
-# Optional extras
-DISCORD_WEBHOOK=https://discord.com/api/webhooks/...
-REPORT_EMAIL_TO=you@example.com
-REPORT_EMAIL_FROM=alerts@example.com
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_TLS=true
-SMTP_USER=alerts@example.com
-SMTP_PASS=*********
-STATE_FILE=.arbor_everything_state.json
-
-Usage (locally)
----------------
-python -m pip install playwright python-dotenv requests pandas
-python -m playwright install
-python monitor_arbor_portal.py
+Usage (locally):
+  python3 -m pip install playwright python-dotenv requests pandas
+  python3 -m playwright install
+  python3 monitor_arbor_portal.py
 """
 
+# --- Stdlib
 import os
-import sys
+import re
+import json
+import time
+import hashlib
+import argparse
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from urllib.parse import urlparse
+
+# --- Third-party
 import requests
-from dotenv import load_dotenv
-
-# Load .env file
-if load_dotenv:
-    load_dotenv()
-
-import os, re
-from urllib.parse import urlparse, urlunparse
-
-# read from env as you do now
-ARBOR_BASE_URL = os.getenv("ARBOR_BASE_URL", "https://login.arbor.sc").rstrip("/")
-
-def normalize_base_url(url: str) -> str:
-    """Prefer the .sc tenant host; fall back to given URL."""
-    u = url.rstrip("/")
-    # If a reset link or .education host was pasted, try to map to .sc
-    if ".education" in u and ".arbor.education" in u:
-        # e.g. https://the-castle-school.uk.arbor.education/...  -> https://the-castle-school.uk.arbor.sc
-        parts = urlparse(u)
-        host = parts.netloc.replace(".arbor.education", ".arbor.sc")
-        return f"https://{host}"
-    return u
-
-ARBOR_BASE_URL = normalize_base_url(ARBOR_BASE_URL)
-
-# ---------------------------------------------------------------------
-# Telegram test helper (only runs if you use --test)
-# ---------------------------------------------------------------------
-def telegram_test():
-    """Send a one-off test message to confirm Telegram config works."""
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("⚠️  Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in .env")
-        return False
-    try:
-        msg = "✅ Telegram test passed — watcher starting."
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg},
-            timeout=10,
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            print("⚠️  Telegram test failed:", data)
-            return False
-        print("✅ Telegram connection confirmed.")
-        return True
-    except Exception as e:
-        print("⚠️  Telegram test error:", e)
-        return False
-# ---------------------------------------------------------------------
-
-class MaintenanceMode(Exception):
-    pass
-
-def is_maintenance(page) -> bool:
-    try:
-        txt = (page.text_content("body") or "").lower()
-        return ("maintenance mode is turned on" in txt) or ("undergoing maintenance" in txt)
-    except Exception:
-        return False
-
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, Callable
-import requests
-import pandas as pd
-
+from playwright.sync_api import sync_playwright, Page
 try:
     from dotenv import load_dotenv  # type: ignore
 except Exception:
-    load_dotenv = None  # optional
+    load_dotenv = None
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+# --- Local login
+from login_helper import login_guardian
 
-
-def getenv(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None or v == "":
-        return default
-    return v
-
-
+# ---------- Config ----------
 if load_dotenv:
     load_dotenv()
 
-# --- Telegram connection test --------------------------------------------
-import requests
+ARBOR_EMAIL = os.getenv("ARBOR_EMAIL", "")
+ARBOR_PASSWORD = os.getenv("ARBOR_PASSWORD", "")
+STATE_FILE = os.getenv("STATE_FILE", ".arbor_everything_state.json")
 
-def telegram_test():
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("⚠️  Missing TELEGRAM_TOKEN or TELEGRAM_CHAT_ID in .env")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Defaults (polite) — overridden by --fast or env vars
+MIN_DELAY = float(os.getenv("ARBOR_MIN_DELAY", "1.2"))
+MAX_DELAY = float(os.getenv("ARBOR_MAX_DELAY", "2.6"))
+
+# ---------- Polite access helpers ----------
+import random
+
+def polite_sleep(min_s=None, max_s=None):
+    """Random delay to avoid rapid-fire behaviour."""
+    lo = MIN_DELAY if min_s is None else min_s
+    hi = MAX_DELAY if max_s is None else max_s
+    if hi <= 0:
         return
-    try:
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": "✅ Telegram test passed — watcher starting."},
-            timeout=10,
-        )
-        data = resp.json()
-        if not data.get("ok"):
-            print("⚠️  Telegram test failed:", data)
-        else:
-            print("✅ Telegram connection confirmed.")
-    except Exception as e:
-        print("⚠️  Telegram test error:", e)
+    time.sleep(random.uniform(lo, hi))
 
-telegram_test()
-# --------------------------------------------------------------------------
-
-ARBOR_BASE_URL = getenv("ARBOR_BASE_URL", "https://login.arbor.sc").rstrip("/")
-ARBOR_EMAIL = getenv("ARBOR_EMAIL")
-ARBOR_PASSWORD = getenv("ARBOR_PASSWORD")
-ARBOR_CHILD_DOB = getenv("ARBOR_CHILD_DOB", "")
-STATE_FILE = getenv("STATE_FILE", ".arbor_everything_state.json")
-HEADFUL = getenv("HEADFUL", "").lower() in ("1", "true", "yes", "on")
-
-EMAIL_TO = getenv("REPORT_EMAIL_TO", "")
-EMAIL_FROM = getenv("REPORT_EMAIL_FROM", "")
-SMTP_HOST = getenv("SMTP_HOST", "")
-SMTP_PORT = int(getenv("SMTP_PORT", "587") or "587")
-SMTP_TLS = getenv("SMTP_TLS", "true").lower() in ("1", "true", "yes", "on")
-SMTP_USER = getenv("SMTP_USER", "") or None
-SMTP_PASS = getenv("SMTP_PASS", "") or None
-DISCORD_WEBHOOK = getenv("DISCORD_WEBHOOK", "")
-TELEGRAM_TOKEN = getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = getenv("TELEGRAM_CHAT_ID", "")
-
-
-# Utility helpers
-def sha(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-
-
-def load_state(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(path: str, data: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-# Notification helpers
-def send_email(subject: str, body: str) -> None:
-    if not (EMAIL_TO and EMAIL_FROM and SMTP_HOST):
-        return
-    from email.message import EmailMessage
-    import smtplib
-
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    msg.set_content(body)
-
-    if SMTP_TLS:
-        server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30)
-        server.starttls()
-    else:
-        server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=30)
-
-    try:
-        if SMTP_USER:
-            server.login(SMTP_USER, SMTP_PASS or "")
-        server.send_message(msg)
-    finally:
-        server.quit()
-
-
-def post_discord(text: str) -> None:
-    if not DISCORD_WEBHOOK:
-        return
-    try:
-        requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=15)
-    except Exception as e:
-        print(f"[warn] discord post failed: {e}", file=sys.stderr)
-
-
-def post_telegram(text: str) -> None:
-    token = TELEGRAM_TOKEN
-    chat = TELEGRAM_CHAT_ID
-    if not token or not chat:
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat, "text": text[:4000], "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=15)
-    except Exception as e:
-        print(f"[warn] telegram post failed: {e}", file=sys.stderr)
-
-
-# Login and navigation
-import re
-
-def login_guardian(page) -> None:
-    """
-    Navigate to the guardian login, fill email/pass (and optional DOB),
-    and land on the portal home. Handles .sc/.education and maintenance.
-    """
-    base = ARBOR_BASE_URL
-    candidates = [
-        base,
-        f"{base}/auth/login",
-        f"{base}/login",
-    ]
-
-    # 1) Reach a login page
-    landed = False
-    for url in candidates:
+def polite_request_with_backoff(fn, max_attempts=3, base_delay=2.0, max_delay=60.0):
+    """Run fn() with exponential backoff + jitter on failures."""
+    attempt = 0
+    while attempt < max_attempts:
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            page.wait_for_load_state("networkidle")
-            if is_maintenance(page):
-                raise MaintenanceMode("Arbor shows maintenance page")
-            landed = True
-            break
-        except MaintenanceMode:
-            raise
-        except Exception:
-            continue
-    if not landed:
-        raise RuntimeError("Could not reach Arbor login page. Check ARBOR_BASE_URL.")
+            return fn()
+        except Exception as exc:
+            attempt += 1
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            delay *= random.uniform(0.7, 1.3)
+            print(f"[polite] attempt {attempt} failed: {exc}. Retrying in {delay:.1f}s")
+            time.sleep(delay)
+    return fn()
 
-    # 2) Fill email (try several selectors)
-    email_filled = False
-    for kind, sel in [
-        ("label", re.compile(r"email", re.I)),
-        ("css", "input[type='email']"),
-        ("css", "input[name='email']"),
-        ("css", "input[autocomplete='username']"),
-    ]:
-        try:
-            el = page.get_by_label(sel) if kind == "label" else page.locator(sel).first
-            if el and el.is_visible():
-                el.fill(os.getenv("ARBOR_EMAIL", ""))
-                email_filled = True
-                break
-        except Exception:
-            pass
-    if not email_filled:
-        raise RuntimeError("Could not find email field — confirm you’re on the correct login page.")
+def polite_headers() -> dict:
+    """Identifiable headers so admins can contact you if needed."""
+    return {
+        "User-Agent": "ArborWatcher/1.0 (+email@kristina.digital)",
+        "X-ArborWatcher-Contact": "email@kristina.digital",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
 
-    # 3) Fill password
-    for kind, sel in [
-        ("label", re.compile(r"(password|passcode)", re.I)),
-        ("css", "input[type='password']"),
-        ("css", "input[name='password']"),
-        ("css", "input[autocomplete='current-password']"),
-    ]:
-        try:
-            el = page.get_by_label(sel) if kind == "label" else page.locator(sel).first
-            if el and el.is_visible():
-                el.fill(os.getenv("ARBOR_PASSWORD", ""))
-                break
-        except Exception:
-            pass
+def polite_requests_get(url, session=None, **kwargs):
+    polite_sleep()
+    session = session or requests.Session()
+    headers = polite_headers()
+    headers.update(kwargs.pop("headers", {}))
+    kwargs["headers"] = headers
+    return polite_request_with_backoff(lambda: session.get(url, timeout=20, **kwargs))
 
-    # 4) Submit
-    try:
-        page.get_by_role("button", name=re.compile(r"(log ?in|sign ?in|continue)", re.I)).click()
-    except Exception:
-        btn = page.locator("button[type='submit']").first
-        if btn and btn.is_visible():
-            btn.click()
+def polite_requests_post(url, session=None, **kwargs):
+    polite_sleep()
+    session = session or requests.Session()
+    headers = polite_headers()
+    headers.update(kwargs.pop("headers", {}))
+    kwargs["headers"] = headers
+    return polite_request_with_backoff(lambda: session.post(url, timeout=20, **kwargs))
 
-    # 5) Optional DOB verification
-    dob = os.getenv("ARBOR_CHILD_DOB", "")
-    if dob:
-        try:
-            page.wait_for_timeout(600)
-            dob_input = page.get_by_label(re.compile(r"(date of birth|dob)", re.I))
-            if dob_input and dob_input.is_visible():
-                dob_input.fill(dob)
-                page.get_by_role("button", name=re.compile(r"(verify|continue|confirm)", re.I)).click()
-        except Exception:
-            pass
+def polite_goto(page: Page, url: str):
+    polite_sleep()
+    return polite_request_with_backoff(lambda: page.goto(url, wait_until="domcontentloaded", timeout=45000))
 
-    page.wait_for_load_state("networkidle")
-    if is_maintenance(page):
-        raise MaintenanceMode("Arbor shows maintenance page")
-
+# ---------- Core helpers ----------
+def origin(u: str) -> str:
+    p = urlparse(u)
+    return f"{p.scheme}://{p.netloc}"
 
 @dataclass
 class Item:
@@ -344,239 +130,249 @@ class Item:
     title: str
     meta: str
     when: str
-    href: Optional[str] = None
-    preview: Optional[str] = None
 
+def assert_not_permission_modal(page: Page):
+    try:
+        body = (page.text_content("body") or "").lower()
+    except Exception:
+        body = ""
+    if "it seems like you can't do this" in body:
+        raise RuntimeError("🚫 Permission modal: staff-only or invalid route. Enter guardian shell first.")
 
-# Generic extractor for list-like pages
-def extract_list_rows(container_locator, limit=25) -> List[Dict[str, Any]]:
-    rows = container_locator.locator("li, div[role='listitem'], .ListItem, .card, .row").all()[:limit]
-    out = []
-    for r in rows:
+def ensure_guardian_shell(page: Page) -> bool:
+    if re.search(r"guardian#", page.url, re.I):
+        return True
+    candidates = [
+        ("role", ("link",   re.compile(r"(parent|guardian)\s+portal", re.I))),
+        ("role", ("button", re.compile(r"(parent|guardian)\s+portal", re.I))),
+        ("css",  "a:has-text('Parent Portal')"),
+        ("css",  "a:has-text('Guardian')"),
+        ("css",  "button:has-text('Parent Portal')"),
+        ("css",  "button:has-text('Guardian')"),
+    ]
+    for kind, arg in candidates:
+        try:
+            if kind == "role":
+                role, name = arg
+                el = page.get_by_role(role, name=name)
+                if el and el.is_visible():
+                    el.click()
+                    page.wait_for_load_state("networkidle")
+                    if re.search(r"guardian#", page.url, re.I):
+                        return True
+            else:
+                el = page.locator(arg).first
+                if el and el.is_visible():
+                    el.click()
+                    page.wait_for_load_state("networkidle")
+                    if re.search(r"guardian#", page.url, re.I):
+                        return True
+        except Exception:
+            pass
+
+    # Fallback: any link with guardian
+    try:
+        hrefs = page.eval_on_selector_all(
+            "a[href*='guardian']",
+            "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+        ) or []
+        if hrefs:
+            target = hrefs[0]
+            if target.startswith("http"):
+                polite_goto(page, target)
+            else:
+                base = origin(page.url)
+                if not target.startswith('/'):
+                    target = '/' + target
+                polite_goto(page, base + target)
+            page.wait_for_load_state("networkidle")
+            return bool(re.search(r"guardian#", page.url, re.I))
+    except Exception:
+        pass
+    return False
+
+def enter_guardian_or_retry(page: Page) -> None:
+    ok = ensure_guardian_shell(page)
+    try:
+        assert_not_permission_modal(page)
+    except RuntimeError:
+        ok = ensure_guardian_shell(page) or ok
+        assert_not_permission_modal(page)
+    if not ok:
+        pass
+
+def goto(page: Page, base: str, path: str):
+    url = f"{base}{path}"
+    polite_goto(page, url)
+    page.wait_for_load_state("networkidle")
+    assert_not_permission_modal(page)
+
+def lazy_scroll_all(page: Page, container: Optional[str] = None, max_passes: int = 40, pause: float = 0.6):
+    last_h = -1
+    for _ in range(max_passes):
+        if container:
+            page.locator(container).evaluate("(el) => el.scrollTo(0, el.scrollHeight)")
+        else:
+            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(pause)
+        h = page.evaluate("() => document.body.scrollHeight")
+        if h == last_h:
+            break
+        last_h = h
+
+def collect_items(page: Page, limit: Optional[int] = None) -> List[Item]:
+    rows: List[Item] = []
+    cards = page.locator("main").locator("li, div[role='listitem'], .ListItem, .card, .row").all()
+    for el in cards:
         try:
             title = ""
-            for sel in ("h3", "h4", ".title", ".Heading", "strong"):
+            for sel in ("h1","h2","h3","h4",".title",".Heading","strong"):
                 try:
-                    el = r.locator(sel).first
-                    if el and el.is_visible():
-                        title = el.inner_text().strip()
-                        break
+                    t = el.locator(sel).first
+                    if t and t.is_visible():
+                        title = (t.inner_text() or "").strip()
+                        if title: break
                 except Exception:
                     pass
             if not title:
-                title = r.inner_text().split("\n")[0].strip()
+                text = (el.inner_text() or "").strip()
+                title = (text.split("\n")[0][:180] if text else "(untitled)")
 
-            meta = ""
-            when = ""
-            preview = None
-            sm = r.locator("small, .meta, .subtext, .subtitle").all()
-            if sm:
-                meta_text = " ".join(s.inner_text().strip() for s in sm[:2])
-                parts = re.split(r"·|\||–|-{1,2}", meta_text)
-                if parts:
-                    meta = parts[0].strip()
-                if len(parts) > 1:
-                    when = parts[1].strip()
-
+            meta, when = "", ""
             try:
-                preview_el = r.locator("p, .preview, .desc, .description").first
-                if preview_el and preview_el.is_visible():
-                    preview = preview_el.inner_text().strip()
+                smalls = el.locator("small, .meta, .subtext, .subtitle").all()
+                if smalls:
+                    meta_text = " ".join((s.inner_text() or "").strip() for s in smalls[:2])
+                    parts = re.split(r"·|\||–|-{1,2}", meta_text)
+                    if parts: meta = parts[0].strip()
+                    if len(parts) > 1: when = parts[1].strip()
             except Exception:
                 pass
 
-            href = None
-            try:
-                a = r.locator("a").first
-                if a:
-                    href = a.get_attribute("href")
-            except Exception:
-                pass
-
-            out.append({"title": title, "meta": meta, "when": when, "href": href, "preview": preview})
+            rows.append(Item(section="", title=title, meta=meta, when=when))
+            if limit and len(rows) >= limit:
+                break
         except Exception:
             continue
-    return out
+    return rows
 
-
-# Section scrapers
-def section_messages(page) -> List[Item]:
-    page.goto(f"{ARBOR_BASE_URL}/guardian#/messages", wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_load_state("networkidle")
-    rows = extract_list_rows(page.locator("main"))
-    return [Item("Messages", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-
-
-def section_comms(page) -> List[Item]:
-    for path in ("/guardian#/communications", "/guardian#/comms", "/guardian#/communication-log"):
+def fetch_section(page: Page, base: str, section: str, paths: List[str]) -> List[Item]:
+    for path in paths:
         try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Communications", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
+            goto(page, base, path)
+            lazy_scroll_all(page)
+            items = collect_items(page)
+            if items:
+                for it in items: it.section = section
+                return items
         except Exception:
             continue
     return []
 
+# ---------- State + Digest ----------
+def load_state(path: str) -> Dict:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def section_notices(page) -> List[Item]:
-    for path in ("/guardian#/noticeboard", "/guardian#/announcements", "/guardian#/news"):
-        try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Noticeboard", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-        except Exception:
-            continue
-    return []
+def save_state(path: str, data: Dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-
-def section_calendar(page) -> List[Item]:
-    for path in ("/guardian#/calendar", "/guardian#/events"):
-        try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Calendar", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-        except Exception:
-            continue
-    return []
-
-
-def section_trips(page) -> List[Item]:
-    for path in ("/guardian#/trips", "/guardian#/activities"):
-        try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Trips", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-        except Exception:
-            continue
-    return []
-
-
-def section_payments(page) -> List[Item]:
-    for path in ("/guardian#/payments", "/guardian#/accounts"):
-        try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Payments", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-        except Exception:
-            continue
-    return []
-
-
-def section_clubs(page) -> List[Item]:
-    for path in ("/guardian#/clubs", "/guardian#/activities/clubs"):
-        try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Clubs", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-        except Exception:
-            continue
-    return []
-
-
-def section_documents(page) -> List[Item]:
-    for path in ("/guardian#/documents", "/guardian#/report-cards", "/guardian#/letters"):
-        try:
-            page.goto(f"{ARBOR_BASE_URL}{path}", wait_until="domcontentloaded", timeout=25000)
-            page.wait_for_load_state("networkidle")
-            rows = extract_list_rows(page.locator("main"))
-            if rows:
-                return [Item("Documents", r["title"], r["meta"], r["when"], r["href"], r["preview"]) for r in rows]
-        except Exception:
-            continue
-    return []
-
-
-SECTIONS: List[Callable] = [
-    section_messages,
-    section_comms,
-    section_notices,
-    section_calendar,
-    section_trips,
-    section_payments,
-    section_clubs,
-    section_documents,
-]
-
+def sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
 
 def build_digest(all_items: List[Item]) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ")
-    lines = [f"Arbor digest at {now}"]
     if not all_items:
-        lines.append("No items found.")
-        return "\n".join(lines)
-
+        return "No new items."
+    # group
     by_section: Dict[str, List[Item]] = {}
     for it in all_items:
         by_section.setdefault(it.section, []).append(it)
+    # format
+    lines = ["Arbor updates:"]
+    for sec in sorted(by_section):
+        lines.append(f"• {sec}")
+        for i in by_section[sec][:8]:
+            suffix = f" — {i.when}" if i.when else ""
+            meta = f" ({i.meta})" if i.meta else ""
+            lines.append(f"  - {i.title}{meta}{suffix}")
+    return "\n".join(lines)
 
-    for section in sorted(by_section.keys()):
-        lines.append("")
-        lines.append(f"{section}:")
-        for it in by_section[section][:10]:
-            lines.append(f"• {it.title}")
-            meta = it.meta.strip()
-            when = it.when.strip()
-            if meta or when:
-                lines.append(f"  {meta}{(' · ' + when) if when else ''}".rstrip())
-            if it.preview:
-                pv = it.preview
-                if len(pv) > 200:
-                    pv = pv[:200].rstrip() + " …"
-                lines.append(f"  {pv}")
-            if it.href:
-                lines.append(f"  Link: {it.href}")
-    return "\n".join(lines).strip()
+# ---------- Notifications ----------
+def post_telegram(text: str) -> None:
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    api = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        polite_requests_post(api, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        })
+    except Exception as e:
+        print(f"[warn] telegram failed: {e}")
 
-
+# ---------- Main ----------
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Polite watcher for Arbor Parent Portal (Telegram alerts)")
+    parser.add_argument("--headless", action="store_true", help="Run headless (default headful)")
+    parser.add_argument("--fast", action="store_true", help="Reduce delays for local runs")
+    args = parser.parse_args()
+
+    global MIN_DELAY, MAX_DELAY
+    if args.fast:
+        MIN_DELAY, MAX_DELAY = 0.2, 0.6
+
     if not (ARBOR_EMAIL and ARBOR_PASSWORD):
-        print("Set ARBOR_EMAIL and ARBOR_PASSWORD in environment or .env", file=sys.stderr)
+        print("Set ARBOR_EMAIL and ARBOR_PASSWORD in environment or .env")
         return 2
 
     state = load_state(STATE_FILE)
-    last = state.get("last", {})
+    last = state.get("last", {}) if isinstance(state, dict) else {}
 
     all_items: List[Item] = []
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=not HEADFUL)
+        browser = pw.chromium.launch(headless=args.headless, slow_mo=0 if args.headless else 200)
         context = browser.new_context()
         page = context.new_page()
-        try:
-            login_guardian(page)
-        except MaintenanceMode:
-            # Optional: notify once per day, then exit 0 to avoid spam
-            # (You can keep the daily-notice logic we discussed earlier)
-            print("⚠️ Arbor is in maintenance mode. Will try again later.")
-            return 0
 
-        # Crawl sections
-        for fn in SECTIONS:
+        # Login & enter guardian shell
+        login_guardian(page)
+        enter_guardian_or_retry(page)
+        base = origin(page.url)
+        print("🔗 Using origin:", base)
+
+        sections = {
+            "Messages":       ["/guardian#/messages"],
+            "Communications": ["/guardian#/communications", "/guardian#/comms", "/guardian#/communication-log"],
+            "Noticeboard":    ["/guardian#/noticeboard", "/guardian#/announcements", "/guardian#/news"],
+            "Calendar":       ["/guardian#/calendar", "/guardian#/events"],
+            "Trips":          ["/guardian#/trips", "/guardian#/activities"],
+            "Payments":       ["/guardian#/payments", "/guardian#/accounts"],
+            "Clubs":          ["/guardian#/clubs", "/guardian#/activities/clubs"],
+            "Documents":      ["/guardian#/documents", "/guardian#/report-cards", "/guardian#/letters"],
+        }
+
+        # Crawl sections (light delay between them) with progress logs
+        for sec, paths in sections.items():
+            print(f"→ Checking {sec} …")
             try:
-                items = fn(page)
+                items = fetch_section(page, base, sec, paths)
                 all_items.extend(items)
             except Exception as e:
-                print(f"[warn] section {fn.__name__} failed: {e}", file=sys.stderr)
+                print(f"[warn] section {sec} failed: {e}")
+            polite_sleep()
 
         browser.close()
 
     if not all_items:
-        print("No items gathered. The portal UI may have changed or access is restricted.")
+        print("No items gathered. Portal UI may have changed or nothing is visible for this account.")
         return 0
 
-    # Compute per-section hashes on top entries
+    # Compute per-section hashes on the first N entries (stable, low-noise)
     current: Dict[str, str] = {}
     by_section: Dict[str, List[Item]] = {}
     for it in all_items:
@@ -591,34 +387,16 @@ def main() -> int:
             changed_sections.append(sec)
 
     if not changed_sections:
+        print("No changes detected.")
         return 0
 
     digest = build_digest(all_items)
-    subject = "Arbor: new updates in " + ", ".join(sorted(changed_sections))
-
-    if EMAIL_TO and EMAIL_FROM and SMTP_HOST:
-        try:
-            send_email(subject, digest)
-        except Exception as e:
-            print(f"[warn] email send failed: {e}", file=sys.stderr)
-
-    post_discord(digest)
-    post_telegram(digest)
-
     print(digest)
+    post_telegram(digest)
 
     state["last"] = current
     save_state(STATE_FILE, state)
     return 0
 
-
-# ---------------------------------------------------------------------
-# Entry point — ensures Telegram test runs only when you use --test
-# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    if "--test" in sys.argv:
-        telegram_test()
-        sys.exit(0)
-    else:
-        sys.exit(main())
-# ---------------------------------------------------------------------
+    raise SystemExit(main())

@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-arbor_full_export.py — One‑off full export for Arbor Parent Portal (polite & fast option)
+arbor_copy.py — Consolidated one-off exporter for Arbor Parent Portal
 
-Features:
-- Logs in via login_helper.login_guardian (supports .education/.sc & SSO)
-- Enters the Guardian/Parent shell safely (auto‑retry)
+- Logs in via login_helper.login_guardian (works with .education/.sc & SSO variants)
+- Enters the Guardian/Parent shell safely (with auto-retry)
 - Crawls key sections and saves JSON+CSV under exports/<timestamp>/
-- Best‑effort document downloads (with polite headers)
-- Creates separate ZIPs per populated section when --zip is used
-- Polite crawling: throttled navigation, exponential backoff + jitter
-- Fast mode: --fast reduces delays for interactive runs
+- Best-effort downloads documents
+- Creates separate ZIPs per populated section (optional --zip)
+- Polite crawling: throttled navigation, backoff & identifiable headers
 
 Usage:
   python3 -m pip install playwright python-dotenv requests pandas
   python3 -m playwright install
-  python3 arbor_full_export.py --zip --headless   # omit --headless to watch
-
-Required:
-  login_helper.py providing login_guardian(page)
+  python3 arbor_copy.py --zip --headless   # or omit --headless to watch
 
 .env keys:
   ARBOR_BASE_URL, ARBOR_EMAIL, ARBOR_PASSWORD
@@ -46,29 +41,23 @@ except Exception:
     load_dotenv = None
 
 # --- Local
+# Requires login_helper.py in the same folder, providing login_guardian(page)
 from login_helper import login_guardian
 
 # ---------- Config ----------
 if load_dotenv:
     load_dotenv()
 
+DEFAULT_BASE = os.getenv("ARBOR_BASE_URL", "https://login.arbor.sc").rstrip("/")
 ARBOR_EMAIL = os.getenv("ARBOR_EMAIL")
 ARBOR_PASSWORD = os.getenv("ARBOR_PASSWORD")
-
-# Defaults (polite) — overridden by --fast or env vars
-MIN_DELAY = float(os.getenv("ARBOR_MIN_DELAY", "1.2"))
-MAX_DELAY = float(os.getenv("ARBOR_MAX_DELAY", "2.6"))
 
 # ---------- Polite access helpers ----------
 import random
 
-def polite_sleep(min_s=None, max_s=None):
+def polite_sleep(min_s=0.5, max_s=1.5):
     """Sleep a random interval between actions to avoid rapid-fire requests."""
-    lo = MIN_DELAY if min_s is None else min_s
-    hi = MAX_DELAY if max_s is None else max_s
-    if hi <= 0:
-        return
-    time.sleep(random.uniform(lo, hi))
+    time.sleep(random.uniform(min_s, max_s))
 
 def polite_request_with_backoff(fn, max_attempts=3, base_delay=2.0, max_delay=60.0):
     """
@@ -375,7 +364,7 @@ def export_all(zip_after: bool = False, headless: bool = False):
         base = origin(page.url)
         print("🔗 Using origin:", base)
 
-        # Crawl sections (polite delay between each) with progress logs
+        # Crawl sections (polite delay between each)
         sections: Dict[str, List[str]] = {
             "Messages":      ["/guardian#/messages"],
             "Communications":[ "/guardian#/communications", "/guardian#/comms", "/guardian#/communication-log"],
@@ -387,20 +376,17 @@ def export_all(zip_after: bool = False, headless: bool = False):
         }
         results: Dict[str, List[Item]] = {}
         for name, paths in sections.items():
-            print(f"→ Exporting {name} …")
             items = fetch_section(page, base, name, paths)
             results[name] = items
-            polite_sleep()
+            polite_sleep(1.5, 3.0)
 
         # Documents (also tries to download files)
-        print("→ Exporting Documents …")
         docs = download_documents(page, base, outdir)
         results["Documents"] = docs
 
         browser.close()
 
     # Save each section
-    from dataclasses import asdict  # ensure available
     for sec, items in results.items():
         rows_to_files(items, outdir, sec.lower())
 
@@ -455,16 +441,10 @@ def export_all(zip_after: bool = False, headless: bool = False):
 
 # ---------- CLI ----------
 def main():
-    ap = argparse.ArgumentParser(description="One-off full export of Arbor Parent Portal")
+    ap = argparse.ArgumentParser(description="Consolidated Arbor Parent Portal exporter")
     ap.add_argument("--zip", action="store_true", help="Create a zip per populated section")
-    ap.add_argument("--headless", action="store_true", help="Run browser headless (default headful for visibility)")
-    ap.add_argument("--fast", action="store_true", help="Reduce delays for local runs")
+    ap.add_argument("--headless", action="store_true", help="Run browser headless (default is headful for visibility)")
     args = ap.parse_args()
-
-    global MIN_DELAY, MAX_DELAY
-    if args.fast:
-        MIN_DELAY, MAX_DELAY = 0.2, 0.6
-
     export_all(zip_after=args.zip, headless=args.headless)
 
 if __name__ == "__main__":
