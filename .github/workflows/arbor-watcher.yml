@@ -1,15 +1,38 @@
 name: Arbor Watcher (Scheduled)
 
 on:
-  schedule:
-    - cron: "0 6 * * *"   # Every day at 06:00 UTC (adjust to taste)
   workflow_dispatch:
+  schedule:
+    # Every hour at minute 7 (tweak to taste)
+    - cron: "7 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arbor-watcher
+  cancel-in-progress: false
 
 jobs:
   run-watcher:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 10
+
+    env:
+      # App config from repo or defaults
+      ORIGIN: https://the-castle-school.uk.arbor.education
+      STATE_FILE: /home/runner/work/_temp/arborwatcher_state.json
+      PYTHONUNBUFFERED: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      CI: "true" # lets the script default to headless if you add that logic later
+
+      # Secrets (set these in repo Settings → Secrets and variables → Actions)
+      ARBOR_EMAIL: ${{ secrets.ARBOR_EMAIL }}
+      ARBOR_PASSWORD: ${{ secrets.ARBOR_PASSWORD }}
+      ARBOR_STUDENT_ID: ${{ secrets.ARBOR_STUDENT_ID }} # e.g. 5739
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -17,23 +40,37 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Ensure Playwright is available
+          pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Run watcher
-        env:
-          ARBOR_BASE_URL: ${{ secrets.ARBOR_BASE_URL }}
-          ARBOR_EMAIL: ${{ secrets.ARBOR_EMAIL }}
-          ARBOR_PASSWORD: ${{ secrets.ARBOR_PASSWORD }}
-          ARBOR_CHILD_DOB: ${{ secrets.ARBOR_CHILD_DOB }}
-          ARBOR_LOGIN_METHOD: ${{ secrets.ARBOR_LOGIN_METHOD }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          STATE_FILE: .arbor_state.json
+      - name: Run watcher (headless)
+        id: watcher
         run: |
-          python monitor_arbor_portal.py
+          echo "Running watcher headless on $ORIGIN for student $ARBOR_STUDENT_ID"
+          python3 monitor_arbor_portal.py --headless --fast || echo "::set-output name=failed::true"
+
+      # If the run failed, try to gather any debug files you emit via --debug-dump
+      - name: Re-run with debug dump on failure
+        if: steps.watcher.outputs.failed == 'true'
+        run: |
+          echo "First run failed. Re-running with --debug-dump for artefacts…"
+          python3 monitor_arbor_portal.py --headless --fast --debug-dump || true
+
+      - name: Upload debug artefacts (if present)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arborwatcher-debug-${{ github.run_id }}
+          path: |
+            **/dump_*.* 
+            **/*.html
+            **/*.png
+          if-no-files-found: ignore
