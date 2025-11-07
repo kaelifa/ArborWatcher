@@ -1,7 +1,7 @@
 name: Arbor Watcher Test
 
 on:
-  workflow_dispatch:   # manual trigger only
+  workflow_dispatch:  # manual trigger only
 
 permissions:
   contents: read
@@ -36,9 +36,8 @@ jobs:
 
       - name: Quick login check
         run: |
-          echo "Attempting login to $ORIGIN..."
           python3 - <<'PYCODE'
-import os, sys
+import os
 from playwright.sync_api import sync_playwright
 email=os.environ['ARBOR_EMAIL']; pw=os.environ['ARBOR_PASSWORD']; origin=os.environ['ORIGIN']
 with sync_playwright() as p:
@@ -48,8 +47,8 @@ with sync_playwright() as p:
     page.locator('input[type=email]').fill(email)
     page.locator('input[type=password]').fill(pw)
     page.locator('button[type=submit]').click()
-    page.wait_for_timeout(5000)
-    print("✅ Logged in OK. Page title:", page.title())
+    page.wait_for_timeout(4000)
+    print("✅ Logged in OK. Title:", page.title())
     browser.close()
 PYCODE
 
@@ -57,4 +56,4 @@ PYCODE
         run: |
           curl -s "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="✅ Arbor Watcher test passed successfully at $(date -u +"%Y-%m-%d %H:%M:%S") UTC"
+            -d text="✅ Arbor Watcher test passed at $(date -u +"%Y-%m-%d %H:%M:%S") UTC"
